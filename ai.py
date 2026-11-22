@@ -332,6 +332,22 @@ def _sd_size(photo: Image.Image, longest: int = 768):
     return width, height
 
 
+def _cloudflare_reason(detail: str) -> str:
+    """Pull the human-readable message out of a Cloudflare error response."""
+    try:
+        data = json.loads(detail)
+        errors = data.get("errors") or []
+        messages = [f"{e.get('code', '')} {e.get('message', '')}".strip() for e in errors if isinstance(e, dict)]
+        if messages:
+            return "; ".join(messages)[:200]
+    except (json.JSONDecodeError, AttributeError):
+        pass
+    text = " ".join(detail.split())
+    if "1010" in text and "<html" in text.lower():
+        return "error 1010: request blocked by Cloudflare's browser check"
+    return text[:200] or "no details"
+
+
 def _image_from_cloudflare(content_type: str, body: bytes) -> Image.Image:
     if content_type.startswith("image/") or body[:8] == b"\x89PNG\r\n\x1a\n" or body[:3] == b"\xff\xd8\xff":
         return Image.open(io.BytesIO(body)).convert("RGB")
@@ -371,11 +387,17 @@ def _edit_with_cloudflare(photo: Image.Image, prompt: str, strength: float = 0.5
         "width": width,
         "height": height,
     }
-    url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/{cf_image_model()}"
+    url = f"https://api.cloudflare.com/client/v4/accounts/{account_id.strip()}/ai/run/{cf_image_model()}"
     request = urllib.request.Request(
         url,
         data=json.dumps(payload).encode("utf-8"),
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        headers={
+            "Authorization": f"Bearer {token.strip()}",
+            "Content-Type": "application/json",
+            "Accept": "application/json, image/png",
+            # Cloudflare can block Python's default "Python-urllib" user agent, so name the app instead
+            "User-Agent": "ModMyRide-AI/1.0 (Streamlit app)",
+        },
         method="POST",
     )
     try:
@@ -384,7 +406,9 @@ def _edit_with_cloudflare(photo: Image.Image, prompt: str, strength: float = 0.5
             body = response.read()
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", "replace")
-        raise _friendly_error(RuntimeError(f"{exc.code} {detail}"), "Cloudflare image model") from exc
+        print(f"[cloudflare] HTTP {exc.code}: {detail[:1000]}")  # full reason in Manage app > logs
+        friendly = _friendly_error(RuntimeError(f"{exc.code} {detail}"), "Cloudflare image model")
+        raise AIError(f"{friendly} (Cloudflare said: HTTP {exc.code} {_cloudflare_reason(detail)})") from exc
     except urllib.error.URLError as exc:
         raise AIError(f"Could not reach Cloudflare: {exc.reason}") from exc
 
