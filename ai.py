@@ -11,8 +11,12 @@ so you can switch models without touching the code.
 On Streamlit Community Cloud, add them under App settings > Secrets.
 """
 
+import base64
 import io
+import json
 import os
+import urllib.error
+import urllib.request
 
 from PIL import Image, ImageOps
 
@@ -28,12 +32,20 @@ def image_model() -> str:
 
 
 def image_backend() -> str:
-    """'gemini' (default) or 'huggingface' (plan B if Gemini image editing is not available to you)."""
+    """'gemini' (default), 'cloudflare' (free daily allowance) or 'huggingface' (small free credits)."""
     return os.getenv("IMAGE_BACKEND", "gemini").strip().lower()
 
 
 def hf_image_model() -> str:
     return os.getenv("HF_IMAGE_MODEL", "black-forest-labs/FLUX.1-Kontext-dev")
+
+
+def cf_image_model() -> str:
+    return os.getenv("CF_IMAGE_MODEL", "@cf/runwayml/stable-diffusion-v1-5-img2img")
+
+
+def uses_cloudflare() -> bool:
+    return image_backend() in ("cloudflare", "cf")
 
 
 MAX_PHOTO_SIDE = 1024  # smaller photos = faster and cheaper edits
@@ -73,22 +85,34 @@ def _friendly_error(exc: Exception, what: str) -> AIError:
     """Turn raw API errors into messages a user (or lecturer) can understand."""
     text = str(exc)
     upper = text.upper()
-    if "429" in text or "RESOURCE_EXHAUSTED" in upper or "QUOTA" in upper:
+    compact = upper.replace(" ", "")
+    if "LIMIT:0" in compact or "LIMIT\":0" in compact:
+        return AIError(
+            f"Your API key has no free quota for the {what}. Switch to the free Cloudflare backend "
+            "(see README: 'Free image backend: Cloudflare'), or enable billing for this model."
+        )
+    if "429" in text or "RESOURCE_EXHAUSTED" in upper or "QUOTA" in upper or "CAPACITY" in upper:
         return AIError(
             f"The {what} has hit its usage limit for now. Wait a minute and try again, "
-            "or check your free-tier quota in Google AI Studio."
+            "or check your free quota for today."
         )
-    if "API_KEY" in upper or "API KEY" in upper or "401" in text or "403" in text or "PERMISSION" in upper:
+    if "API_KEY" in upper or "API KEY" in upper or "401" in text or "403" in text or "PERMISSION" in upper \
+            or "AUTHENTICATION" in upper:
+        if "Cloudflare" in what:
+            return AIError(
+                "Cloudflare rejected the request. Check CF_ACCOUNT_ID and CF_API_TOKEN in your secrets, "
+                "and that the token was made with the 'Workers AI' template."
+            )
         return AIError(
             f"The {what} rejected the API key. Check that GEMINI_API_KEY is correct and that "
             f"your key can use the model '{image_model() if 'image' in what else text_model()}'."
         )
-    if "404" in text or "NOT_FOUND" in upper:
+    if "404" in text or "NOT_FOUND" in upper or "NO ROUTE" in upper:
         return AIError(
-            f"The {what} model was not found. It may have been renamed. Set the "
-            "TEXT_MODEL / IMAGE_MODEL secret to a current model name from ai.google.dev."
+            f"The {what} was not found. It may have been renamed. Set the TEXT_MODEL / IMAGE_MODEL / "
+            "CF_IMAGE_MODEL secret to a current model name."
         )
-    if "SAFETY" in upper or "BLOCKED" in upper:
+    if "SAFETY" in upper or "BLOCKED" in upper or "NSFW" in upper:
         return AIError("The AI refused this request for safety reasons. Try a different photo or style.")
     short = text if len(text) < 200 else text[:200] + "..."
     return AIError(f"Something went wrong with the {what}: {short}")
@@ -120,6 +144,22 @@ You receive the car model and the owner's chosen modifications. Write ONE clear 
 If the owner wrote a free-text request, possibly in Bahasa Melayu or mixed language, translate it into concrete changes.
 If an option says "Keep original", do not change that part.
 Reply with the instruction only, in English, under 120 words, no markdown, no quotes."""
+
+
+KEYWORD_PROMPT_INSTRUCTIONS = """You write prompts for a Stable Diffusion img2img model that restyles a photo of a car.
+
+You receive the car model and the owner's chosen modifications. Write ONE comma-separated prompt under 60 words
+that describes the FINISHED photo (a description, not instructions):
+- start with "photo of a <car model>"
+- then the paint/wrap colour and finish, rims, bodykit parts, extras
+- end with "photorealistic, sharp focus, professional automotive photography"
+Translate any Bahasa Melayu into English. Skip parts marked "Keep original".
+Reply with the prompt only, no quotes, no markdown."""
+
+CF_NEGATIVE_PROMPT = (
+    "deformed car, distorted body, extra wheels, missing wheels, melted, blurry, low quality, cartoon, "
+    "drawing, text, watermark, logo, people"
+)
 
 
 def describe_choices(car_model, preset, colour, finish, rims, bodykit, extras, free_text) -> str:
@@ -165,9 +205,34 @@ def fallback_prompt(choices_text: str) -> str:
     )
 
 
+def keyword_fallback(car_model, preset, colour, finish, rims, bodykit, extras, free_text) -> str:
+    """Short keyword prompt for Stable Diffusion, used if the LLM is unavailable."""
+    parts = [f"photo of a {car_model}" if car_model and not car_model.startswith("Other") else "photo of a car"]
+    if preset and preset != "None":
+        parts.append(f"{preset} style")
+    paint = " ".join(x for x in (colour, finish) if x and x != "Keep original")
+    if paint:
+        parts.append(f"{paint} paint")
+    if rims and rims != "Keep original":
+        parts.append(f"{rims} rims")
+    if bodykit and bodykit != "Keep original":
+        parts.append(bodykit.lower())
+    parts.extend(e.lower() for e in (extras or []))
+    if free_text and free_text.strip():
+        parts.append(free_text.strip())
+    parts.append("photorealistic, sharp focus, professional automotive photography")
+    return ", ".join(parts)
+
+
 def build_edit_prompt(car_model, preset, colour, finish, rims, bodykit, extras, free_text):
-    """Return (prompt, used_llm). Falls back to a template if Gemini text is unavailable."""
+    """Return (prompt, used_llm). Falls back to a template if Gemini text is unavailable.
+
+    Gemini image models get a full editing instruction; the Cloudflare Stable Diffusion model
+    gets a short keyword-style description, which is what that model understands best.
+    """
     choices_text = describe_choices(car_model, preset, colour, finish, rims, bodykit, extras, free_text)
+    keyword_style = uses_cloudflare()
+    instructions = KEYWORD_PROMPT_INSTRUCTIONS if keyword_style else PROMPT_BUILDER_INSTRUCTIONS
     try:
         from google.genai import types
 
@@ -175,7 +240,7 @@ def build_edit_prompt(car_model, preset, colour, finish, rims, bodykit, extras, 
         response = client.models.generate_content(
             model=text_model(),
             contents=choices_text,
-            config=types.GenerateContentConfig(system_instruction=PROMPT_BUILDER_INSTRUCTIONS),
+            config=types.GenerateContentConfig(system_instruction=instructions),
         )
         prompt = (response.text or "").strip()
         if prompt:
@@ -184,13 +249,18 @@ def build_edit_prompt(car_model, preset, colour, finish, rims, bodykit, extras, 
         raise  # missing key: the image step would fail too, so tell the user now
     except Exception as exc:  # noqa: BLE001 - any LLM failure falls back to the template
         print(f"[prompt builder] falling back to template: {exc}")
+    if keyword_style:
+        return keyword_fallback(car_model, preset, colour, finish, rims, bodykit, extras, free_text), False
     return fallback_prompt(choices_text), False
 
 
 # ---------------------------------------------------------------------------
 # 2. Image editor
 # ---------------------------------------------------------------------------
-def edit_image(photo: Image.Image, prompt: str) -> Image.Image:
+def edit_image(photo: Image.Image, prompt: str, strength: float = 0.5) -> Image.Image:
+    """strength (0-1) is only used by the Cloudflare model: lower keeps the result closer to the photo."""
+    if uses_cloudflare():
+        return _edit_with_cloudflare(photo, prompt, strength)
     if image_backend() in ("huggingface", "hf"):
         return _edit_with_huggingface(photo, prompt)
     return _edit_with_gemini(photo, prompt)
@@ -252,6 +322,74 @@ def _edit_with_huggingface(photo: Image.Image, prompt: str) -> Image.Image:
     except Exception as exc:  # noqa: BLE001
         raise _friendly_error(exc, "Hugging Face image model") from exc
     return result.convert("RGB")
+
+
+def _sd_size(photo: Image.Image, longest: int = 768):
+    """Stable Diffusion 1.5 works best around 512-768 px, with sides in multiples of 64."""
+    scale = longest / max(photo.size)
+    width = max(256, int(photo.width * scale) // 64 * 64)
+    height = max(256, int(photo.height * scale) // 64 * 64)
+    return width, height
+
+
+def _image_from_cloudflare(content_type: str, body: bytes) -> Image.Image:
+    if content_type.startswith("image/") or body[:8] == b"\x89PNG\r\n\x1a\n" or body[:3] == b"\xff\xd8\xff":
+        return Image.open(io.BytesIO(body)).convert("RGB")
+    try:
+        data = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise AIError("Cloudflare returned something that is not an image.") from exc
+    if not data.get("success", True):
+        raise _friendly_error(RuntimeError(json.dumps(data.get("errors"))), "Cloudflare image model")
+    result = data.get("result")
+    encoded = result.get("image") if isinstance(result, dict) else None
+    if encoded:
+        return Image.open(io.BytesIO(base64.b64decode(encoded))).convert("RGB")
+    raise AIError("Cloudflare did not return an image. Try again or try a different photo.")
+
+
+def _edit_with_cloudflare(photo: Image.Image, prompt: str, strength: float = 0.5) -> Image.Image:
+    account_id = os.getenv("CF_ACCOUNT_ID")
+    token = os.getenv("CF_API_TOKEN")
+    if not account_id or not token:
+        raise AIError(
+            "IMAGE_BACKEND is 'cloudflare' but CF_ACCOUNT_ID or CF_API_TOKEN is missing from your secrets."
+        )
+
+    width, height = _sd_size(photo)
+    resized = photo.resize((width, height), Image.Resampling.LANCZOS)
+    buffer = io.BytesIO()
+    resized.save(buffer, format="PNG")
+
+    payload = {
+        "prompt": prompt,
+        "negative_prompt": CF_NEGATIVE_PROMPT,
+        "image": list(buffer.getvalue()),
+        "strength": float(min(max(strength, 0.1), 0.95)),
+        "guidance": 7.5,
+        "num_steps": 20,
+        "width": width,
+        "height": height,
+    }
+    url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/{cf_image_model()}"
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=120) as response:
+            content_type = response.headers.get("Content-Type", "")
+            body = response.read()
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")
+        raise _friendly_error(RuntimeError(f"{exc.code} {detail}"), "Cloudflare image model") from exc
+    except urllib.error.URLError as exc:
+        raise AIError(f"Could not reach Cloudflare: {exc.reason}") from exc
+
+    result = _image_from_cloudflare(content_type, body)
+    return result.resize(photo.size, Image.Resampling.LANCZOS)
 
 
 # ---------------------------------------------------------------------------

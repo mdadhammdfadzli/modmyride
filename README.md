@@ -76,6 +76,26 @@ Class names are matched to the app's car list automatically, so `Myvi` becomes `
 
 **To change the key later:** in your app, open the menu (bottom right "Manage app" or the three dots), go to **Settings > Secrets**, edit, and save.
 
+## Free image backend: Cloudflare Workers AI
+
+If your Gemini key has no free quota for image editing ("no free quota" or "usage limit" errors), switch the image step to Cloudflare. Gemini still writes the prompts and runs the Style Advisor.
+
+1. Create a free account at **dash.cloudflare.com/sign-up**. No credit card needed.
+2. **Account ID:** in the dashboard, open **Workers AI** (under "AI" in the left menu). Choose **Use REST API**. Copy the **Account ID** shown there.
+3. **API token:** on the same page, click **Create a Workers AI API Token**, then **Create API Token**. Copy the token (it is only shown once).
+4. In Streamlit, open your app's **Settings > Secrets** and add these lines under your Gemini key:
+   ```toml
+   IMAGE_BACKEND = "cloudflare"
+   CF_ACCOUNT_ID = "your-account-id"
+   CF_API_TOKEN = "your-api-token"
+   ```
+5. Save. The app restarts within about a minute, and a new slider appears: **"How much should the AI change your photo?"**
+
+**Tips for good results with Cloudflare:**
+- Start with the slider at 0.5. Go lower (0.35 to 0.45) if the car's shape changes; go higher (0.6 to 0.7) if the colour hardly changes.
+- Colour and finish changes work best. Small details like rim designs or bodykits are harder for this model.
+- This is an older Stable Diffusion 1.5 model, so results are less realistic than Gemini's. Mention this trade-off in your report (free vs. quality).
+
 ## Run it on your own computer (optional)
 
 You need Python 3.11 or 3.12.
@@ -104,7 +124,10 @@ Add these in Streamlit Cloud under **Settings > Secrets**, one per line in the f
 | `GEMINI_API_KEY` | Yes | none | Your Gemini key |
 | `TEXT_MODEL` | No | `gemini-3.5-flash` | Model for the prompt builder and style advisor |
 | `IMAGE_MODEL` | No | `gemini-3.1-flash-image` | Model that edits the car photo |
-| `IMAGE_BACKEND` | No | `gemini` | Set to `huggingface` to use plan B below |
+| `IMAGE_BACKEND` | No | `gemini` | `gemini`, `cloudflare` (free, see above) or `huggingface` (plan B below) |
+| `CF_ACCOUNT_ID` | For Cloudflare | none | Your Cloudflare account ID |
+| `CF_API_TOKEN` | For Cloudflare | none | Cloudflare Workers AI API token |
+| `CF_IMAGE_MODEL` | No | `@cf/runwayml/stable-diffusion-v1-5-img2img` | Cloudflare image-to-image model |
 | `HF_TOKEN` | Only for plan B | none | Hugging Face access token |
 | `HF_IMAGE_MODEL` | No | `black-forest-labs/FLUX.1-Kontext-dev` | Hugging Face image-editing model for plan B |
 

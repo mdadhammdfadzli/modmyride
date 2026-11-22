@@ -21,8 +21,8 @@ from PIL import Image
 import ai
 from classifier import CarClassifier
 
-SECRET_NAMES = ["GEMINI_API_KEY", "GOOGLE_API_KEY", "TEXT_MODEL", "IMAGE_MODEL",
-                "IMAGE_BACKEND", "HF_TOKEN", "HF_IMAGE_MODEL"]
+SECRET_NAMES = ["GEMINI_API_KEY", "GOOGLE_API_KEY", "TEXT_MODEL", "IMAGE_MODEL", "IMAGE_BACKEND",
+                "HF_TOKEN", "HF_IMAGE_MODEL", "CF_ACCOUNT_ID", "CF_API_TOKEN", "CF_IMAGE_MODEL"]
 
 # ---------------------------------------------------------------------------
 # Options shown in the app
@@ -144,7 +144,7 @@ def create_design(original, choices: dict, number: int) -> dict:
         choices["car_model"], choices["preset"], choices["colour"], choices["finish"],
         choices["rims"], choices["bodykit"], choices["extras"], choices["free_text"],
     )
-    result = ai.edit_image(original, prompt)
+    result = ai.edit_image(original, prompt, choices.get("strength", 0.5))
     return {
         "original": original,
         "image": result,
@@ -259,8 +259,15 @@ def render_style_column() -> dict:
         placeholder="e.g. Nak nampak macam kereta drift Jepun, warna biru gelap dengan rim emas",
         height=80,
     )
+    strength = 0.5
+    if ai.uses_cloudflare():
+        strength = st.slider(
+            "How much should the AI change your photo?", min_value=0.3, max_value=0.8, value=0.5, step=0.05,
+            help="Lower keeps your car's shape and background closer to the original. "
+                 "Higher gives stronger style changes but may distort the car.",
+        )
     return {"car_model": car_model, "preset": preset, "colour": colour, "finish": finish, "rims": rims,
-            "bodykit": bodykit, "extras": extras, "free_text": free_text}
+            "bodykit": bodykit, "extras": extras, "free_text": free_text, "strength": strength}
 
 
 def run_generation(choices: dict):
