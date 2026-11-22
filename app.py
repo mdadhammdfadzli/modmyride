@@ -260,7 +260,7 @@ def render_style_column() -> dict:
         height=80,
     )
     strength = 0.5
-    if ai.uses_cloudflare():
+    if ai.cf_uses_strength():
         strength = st.slider(
             "How much should the AI change your photo?", min_value=0.3, max_value=0.8, value=0.5, step=0.05,
             help="Lower keeps your car's shape and background closer to the original. "

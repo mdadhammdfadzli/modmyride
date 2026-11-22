@@ -17,6 +17,7 @@ import json
 import os
 import urllib.error
 import urllib.request
+import uuid
 
 from PIL import Image, ImageOps
 
@@ -32,7 +33,7 @@ def image_model() -> str:
 
 
 def image_backend() -> str:
-    """'gemini' (default), 'cloudflare' (free daily allowance) or 'huggingface' (small free credits)."""
+    """'gemini' (default), 'cloudflare' (free daily allowance, FLUX.2) or 'huggingface' (small free credits)."""
     return os.getenv("IMAGE_BACKEND", "gemini").strip().lower()
 
 
@@ -41,11 +42,16 @@ def hf_image_model() -> str:
 
 
 def cf_image_model() -> str:
-    return os.getenv("CF_IMAGE_MODEL", "@cf/runwayml/stable-diffusion-v1-5-img2img")
+    return os.getenv("CF_IMAGE_MODEL", "@cf/black-forest-labs/flux-2-klein-4b")
 
 
 def uses_cloudflare() -> bool:
     return image_backend() in ("cloudflare", "cf")
+
+
+def cf_uses_strength() -> bool:
+    """Only the older Stable Diffusion img2img models have a 'strength' setting (FLUX.2 does not)."""
+    return uses_cloudflare() and "stable-diffusion" in cf_image_model()
 
 
 MAX_PHOTO_SIDE = 1024  # smaller photos = faster and cheaper edits
@@ -95,6 +101,12 @@ def _friendly_error(exc: Exception, what: str) -> AIError:
         return AIError(
             f"The {what} has hit its usage limit for now. Wait a minute and try again, "
             "or check your free quota for today."
+        )
+    if "NOT ALLOWED TO ACCESS" in upper:
+        return AIError(
+            f"Your Cloudflare account is not allowed to use the model '{cf_image_model()}'. "
+            "Remove CF_IMAGE_MODEL from your secrets to use the default FLUX.2 [klein] model, "
+            "or set it to another image model from the Workers AI catalog."
         )
     if "API_KEY" in upper or "API KEY" in upper or "401" in text or "403" in text or "PERMISSION" in upper \
             or "AUTHENTICATION" in upper:
@@ -227,11 +239,11 @@ def keyword_fallback(car_model, preset, colour, finish, rims, bodykit, extras, f
 def build_edit_prompt(car_model, preset, colour, finish, rims, bodykit, extras, free_text):
     """Return (prompt, used_llm). Falls back to a template if Gemini text is unavailable.
 
-    Gemini image models get a full editing instruction; the Cloudflare Stable Diffusion model
-    gets a short keyword-style description, which is what that model understands best.
+    Gemini and FLUX.2 image models get a full editing instruction; older Stable Diffusion models
+    get a short keyword-style description, which is what they understand best.
     """
     choices_text = describe_choices(car_model, preset, colour, finish, rims, bodykit, extras, free_text)
-    keyword_style = uses_cloudflare()
+    keyword_style = cf_uses_strength()
     instructions = KEYWORD_PROMPT_INSTRUCTIONS if keyword_style else PROMPT_BUILDER_INSTRUCTIONS
     try:
         from google.genai import types
@@ -258,7 +270,7 @@ def build_edit_prompt(car_model, preset, colour, finish, rims, bodykit, extras, 
 # 2. Image editor
 # ---------------------------------------------------------------------------
 def edit_image(photo: Image.Image, prompt: str, strength: float = 0.5) -> Image.Image:
-    """strength (0-1) is only used by the Cloudflare model: lower keeps the result closer to the photo."""
+    """strength (0-1) is only used by older Stable Diffusion models: lower keeps the result closer to the photo."""
     if uses_cloudflare():
         return _edit_with_cloudflare(photo, prompt, strength)
     if image_backend() in ("huggingface", "hf"):
@@ -364,19 +376,93 @@ def _image_from_cloudflare(content_type: str, body: bytes) -> Image.Image:
     raise AIError("Cloudflare did not return an image. Try again or try a different photo.")
 
 
-def _edit_with_cloudflare(photo: Image.Image, prompt: str, strength: float = 0.5) -> Image.Image:
-    account_id = os.getenv("CF_ACCOUNT_ID")
-    token = os.getenv("CF_API_TOKEN")
+def _multipart_body(fields: dict, files: dict):
+    """Build a multipart/form-data body (what FLUX.2 on Workers AI expects) using only the standard library."""
+    boundary = f"----ModMyRide{uuid.uuid4().hex}"
+    body = b""
+    for name, value in fields.items():
+        body += (f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n'
+                 f"{value}\r\n").encode("utf-8")
+    for name, (filename, data, content_type) in files.items():
+        body += (f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"; filename="{filename}"\r\n'
+                 f"Content-Type: {content_type}\r\n\r\n").encode("utf-8") + data + b"\r\n"
+    body += f"--{boundary}--\r\n".encode("utf-8")
+    return body, f"multipart/form-data; boundary={boundary}"
+
+
+def _flux_output_size(photo: Image.Image, longest: int = 1024):
+    """Output size with the photo's shape, sides in multiples of 16, within FLUX.2's 256-1920 range."""
+    scale = longest / max(photo.size)
+    width = min(1920, max(256, int(photo.width * scale) // 16 * 16))
+    height = min(1920, max(256, int(photo.height * scale) // 16 * 16))
+    return width, height
+
+
+def _cloudflare_post(data: bytes, content_type: str) -> Image.Image:
+    account_id = (os.getenv("CF_ACCOUNT_ID") or "").strip()
+    token = (os.getenv("CF_API_TOKEN") or "").strip()
     if not account_id or not token:
         raise AIError(
             "IMAGE_BACKEND is 'cloudflare' but CF_ACCOUNT_ID or CF_API_TOKEN is missing from your secrets."
         )
+    url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/{cf_image_model()}"
+    request = urllib.request.Request(
+        url,
+        data=data,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": content_type,
+            "Accept": "application/json, image/png",
+            # Cloudflare can block Python's default "Python-urllib" user agent, so name the app instead
+            "User-Agent": "ModMyRide-AI/1.0 (Streamlit app)",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=120) as response:
+            response_type = response.headers.get("Content-Type", "")
+            body = response.read()
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")
+        print(f"[cloudflare] HTTP {exc.code}: {detail[:1000]}")  # full reason in Manage app > logs
+        friendly = _friendly_error(RuntimeError(f"{exc.code} {detail}"), "Cloudflare image model")
+        raise AIError(f"{friendly} (Cloudflare said: HTTP {exc.code} {_cloudflare_reason(detail)})") from exc
+    except urllib.error.URLError as exc:
+        raise AIError(f"Could not reach Cloudflare: {exc.reason}") from exc
+    return _image_from_cloudflare(response_type, body)
 
+
+def _edit_with_cloudflare(photo: Image.Image, prompt: str, strength: float = 0.5) -> Image.Image:
+    if cf_uses_strength():
+        return _cloudflare_sd_img2img(photo, prompt, strength)
+    return _cloudflare_flux_edit(photo, prompt)
+
+
+def _cloudflare_flux_edit(photo: Image.Image, prompt: str) -> Image.Image:
+    """FLUX.2 [klein]: send the car photo as reference image 0 plus the editing instruction."""
+    reference = photo.copy()
+    reference.thumbnail((511, 511), Image.Resampling.LANCZOS)  # input images must be smaller than 512x512
+    buffer = io.BytesIO()
+    reference.save(buffer, format="PNG")
+
+    width, height = _flux_output_size(photo)
+    fields = {
+        "prompt": "Edit the car in the reference photo (image 0). " + prompt,
+        "width": str(width),
+        "height": str(height),
+    }
+    files = {"input_image_0": ("car.png", buffer.getvalue(), "image/png")}
+    data, content_type = _multipart_body(fields, files)
+    result = _cloudflare_post(data, content_type)
+    return result.resize(photo.size, Image.Resampling.LANCZOS)
+
+
+def _cloudflare_sd_img2img(photo: Image.Image, prompt: str, strength: float = 0.5) -> Image.Image:
+    """Older Stable Diffusion img2img models (only if CF_IMAGE_MODEL is set to one)."""
     width, height = _sd_size(photo)
     resized = photo.resize((width, height), Image.Resampling.LANCZOS)
     buffer = io.BytesIO()
     resized.save(buffer, format="PNG")
-
     payload = {
         "prompt": prompt,
         "negative_prompt": CF_NEGATIVE_PROMPT,
@@ -387,32 +473,7 @@ def _edit_with_cloudflare(photo: Image.Image, prompt: str, strength: float = 0.5
         "width": width,
         "height": height,
     }
-    url = f"https://api.cloudflare.com/client/v4/accounts/{account_id.strip()}/ai/run/{cf_image_model()}"
-    request = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {token.strip()}",
-            "Content-Type": "application/json",
-            "Accept": "application/json, image/png",
-            # Cloudflare can block Python's default "Python-urllib" user agent, so name the app instead
-            "User-Agent": "ModMyRide-AI/1.0 (Streamlit app)",
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=120) as response:
-            content_type = response.headers.get("Content-Type", "")
-            body = response.read()
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", "replace")
-        print(f"[cloudflare] HTTP {exc.code}: {detail[:1000]}")  # full reason in Manage app > logs
-        friendly = _friendly_error(RuntimeError(f"{exc.code} {detail}"), "Cloudflare image model")
-        raise AIError(f"{friendly} (Cloudflare said: HTTP {exc.code} {_cloudflare_reason(detail)})") from exc
-    except urllib.error.URLError as exc:
-        raise AIError(f"Could not reach Cloudflare: {exc.reason}") from exc
-
-    result = _image_from_cloudflare(content_type, body)
+    result = _cloudflare_post(json.dumps(payload).encode("utf-8"), "application/json")
     return result.resize(photo.size, Image.Resampling.LANCZOS)
 
 
