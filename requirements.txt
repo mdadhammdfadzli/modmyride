@@ -1,8 +1,0 @@
-streamlit>=1.40
-google-genai>=1.0.0
-huggingface_hub>=0.30.0
-pillow>=10.0
-# Car classifier (Teachable Machine Keras model). Skipped automatically on Python 3.13+,
-# in which case the app still works and users pick their car model from the list.
-tensorflow==2.18.1; python_version < "3.13"
-tf-keras==2.18.0; python_version < "3.13"
