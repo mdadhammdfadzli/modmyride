@@ -63,9 +63,11 @@ CSS = f"""
 }}
 .mmr-hero h1 {{
   font-family: var(--mmr-display); font-weight: 900; color: #F2F3F5;
-  font-size: clamp(2.6rem, 10vw, 6.4rem); line-height: 0.88; margin: 0 0 0.9rem; padding: 0;
-  max-width: 9ch;
+  font-size: clamp(2.6rem, 8.5vw, 5.6rem); line-height: 0.92; margin: 0 0 0.9rem; padding: 0;
+  word-break: normal; overflow-wrap: normal; hyphens: none;
 }}
+.mmr-hero h1 .mmr-word {{ display: inline-block; white-space: nowrap; }}
+[class^="mmr-"] [data-testid="stHeaderActionElements"], .mmr-hero h1 a {{ display: none; }}
 .mmr-hero p {{ color: #C3C8D2; font-size: 1.08rem; line-height: 1.5; max-width: 38ch; margin: 0; }}
 .mmr-stripes {{
   position: absolute; z-index: -1; top: -60%; right: 6%; height: 220%;
@@ -85,14 +87,22 @@ CSS = f"""
 @media (prefers-reduced-motion: reduce) {{ .mmr-stripes span {{ animation: none; }} }}
 
 /* ---------- tabs ---------- */
-.stTabs [data-baseweb="tab-list"] {{ gap: 0.4rem; }}
-.stTabs [data-baseweb="tab"] {{
-  font-family: var(--mmr-display); font-weight: 800; font-size: 1.25rem;
-  padding: 0.35rem 1.1rem; border-radius: 999px; color: var(--mmr-muted); height: auto;
+.stTabs [data-baseweb="tab-list"], .stTabs [role="tablist"] {{
+  gap: 0.4rem; height: auto; overflow: visible; padding: 0.3rem 0; margin-bottom: 0.6rem;
 }}
-.stTabs [data-baseweb="tab"] p {{ font-family: var(--mmr-display); font-weight: 800; font-size: 1.25rem; }}
-.stTabs [aria-selected="true"] {{ background: var(--mmr-ink); color: #F2F3F5; }}
-.stTabs [aria-selected="true"] p {{ color: #F2F3F5; }}
+.stTabs [data-baseweb="tab"], .stTabs button[role="tab"] {{
+  height: auto; min-height: 2.6rem; padding: 0.45rem 1.15rem; border-radius: 999px;
+  background: transparent; border: 1.5px solid transparent;
+}}
+.stTabs button[role="tab"] p, .stTabs [data-baseweb="tab"] p {{
+  font-family: var(--mmr-display); font-weight: 800; font-size: 1.15rem; line-height: 1.1;
+  margin: 0; color: var(--mmr-muted);
+}}
+.stTabs button[role="tab"]:hover {{ border-color: var(--mmr-ink); }}
+.stTabs button[role="tab"][aria-selected="true"], .stTabs [data-baseweb="tab"][aria-selected="true"] {{
+  background: var(--mmr-ink); border-color: var(--mmr-ink);
+}}
+.stTabs button[role="tab"][aria-selected="true"] p, .stTabs [data-baseweb="tab"][aria-selected="true"] p {{ color: #F2F3F5; }}
 .stTabs [data-baseweb="tab-highlight"], .stTabs [data-baseweb="tab-border"] {{ display: none; }}
 
 /* ---------- masking-tape step tags ---------- */
@@ -180,7 +190,7 @@ def hero_html() -> str:
     return (
         '<section class="mmr-hero">'
         '<div class="mmr-stripes" aria-hidden="true"><span></span><span></span></div>'
-        "<h1>ModMyRide AI</h1>"
+        '<h1><span class="mmr-word">ModMyRide</span> <span class="mmr-word">AI</span></h1>'
         "<p>Try a new wrap, rims and bodykit on a photo of your own car "
         "before you spend a ringgit at the workshop.</p>"
         "</section>"
