@@ -246,8 +246,7 @@ def build_edit_prompt(car_model, preset, colour, finish, rims, bodykit, extras, 
     keyword_style = cf_uses_strength()
     instructions = KEYWORD_PROMPT_INSTRUCTIONS if keyword_style else PROMPT_BUILDER_INSTRUCTIONS
     try:
-        from google.genai import types
-
+        types = _genai_types()
         client = _get_gemini_client()
         response = client.models.generate_content(
             model=text_model(),
@@ -257,8 +256,11 @@ def build_edit_prompt(car_model, preset, colour, finish, rims, bodykit, extras, 
         prompt = (response.text or "").strip()
         if prompt:
             return prompt, True
-    except AIError:
-        raise  # missing key: the image step would fail too, so tell the user now
+    except AIError as exc:
+        if "not installed" in str(exc):
+            print(f"[prompt builder] {exc} Falling back to the template prompt.")
+        else:
+            raise  # missing key: tell the user now
     except Exception as exc:  # noqa: BLE001 - any LLM failure falls back to the template
         print(f"[prompt builder] falling back to template: {exc}")
     if keyword_style:
@@ -279,7 +281,7 @@ def edit_image(photo: Image.Image, prompt: str, strength: float = 0.5) -> Image.
 
 
 def _edit_with_gemini(photo: Image.Image, prompt: str) -> Image.Image:
-    from google.genai import types
+    types = _genai_types()
 
     client = _get_gemini_client()
     try:
@@ -502,9 +504,20 @@ def _message_text(content) -> str:
     return "" if content is None else str(content)
 
 
-def advisor_reply(message: str, history: list, car_model: str | None = None) -> str:
-    from google.genai import types
+def _genai_types():
+    """Import the Gemini SDK types, with a clear message if the package is missing."""
+    try:
+        from google.genai import types
+    except ImportError as exc:
+        raise AIError(
+            "The Gemini package (google-genai) is not installed on the server. "
+            "Check that requirements.txt on GitHub lists google-genai, then reboot the app."
+        ) from exc
+    return types
 
+
+def advisor_reply(message: str, history: list, car_model: str | None = None) -> str:
+    types = _genai_types()
     client = _get_gemini_client()
 
     contents = []
