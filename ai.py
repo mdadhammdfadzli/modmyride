@@ -131,6 +131,67 @@ def _friendly_error(exc: Exception, what: str) -> AIError:
 
 
 # ---------------------------------------------------------------------------
+# Gemini text over plain HTTPS (no extra package needed)
+# ---------------------------------------------------------------------------
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+
+
+def _gemini_api_key() -> str:
+    api_key = (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip()
+    if not api_key:
+        raise AIError(
+            "No Gemini API key found. Get a free key at aistudio.google.com, then add it as a "
+            "secret named GEMINI_API_KEY (Streamlit Community Cloud: App settings > Secrets)."
+        )
+    return api_key
+
+
+def _gemini_reason(detail: str) -> str:
+    try:
+        return str(json.loads(detail).get("error", {}).get("message", ""))[:200] or detail[:200]
+    except (json.JSONDecodeError, AttributeError):
+        return " ".join(detail.split())[:200]
+
+
+def gemini_text(system_instruction: str, turns: list) -> str:
+    """Ask the Gemini text model. turns = [("user" | "model", text), ...], oldest first."""
+    body = {
+        "systemInstruction": {"parts": [{"text": system_instruction}]},
+        "contents": [{"role": role, "parts": [{"text": text}]} for role, text in turns],
+    }
+    request = urllib.request.Request(
+        GEMINI_URL.format(model=text_model()),
+        data=json.dumps(body).encode("utf-8"),
+        headers={
+            "x-goog-api-key": _gemini_api_key(),
+            "Content-Type": "application/json",
+            "User-Agent": "ModMyRide-AI/1.0 (Streamlit app)",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")
+        print(f"[gemini] HTTP {exc.code}: {detail[:1000]}")  # full reason in Manage app > logs
+        friendly = _friendly_error(RuntimeError(f"{exc.code} {detail}"), "Gemini text model")
+        raise AIError(f"{friendly} (Gemini said: HTTP {exc.code} {_gemini_reason(detail)})") from exc
+    except urllib.error.URLError as exc:
+        raise AIError(f"Could not reach Gemini: {exc.reason}") from exc
+
+    candidates = data.get("candidates") or []
+    parts = ((candidates[0].get("content") or {}).get("parts") or []) if candidates else []
+    text = "".join(part.get("text", "") for part in parts if isinstance(part, dict)).strip()
+    if not text:
+        blocked = (data.get("promptFeedback") or {}).get("blockReason")
+        if blocked:
+            raise AIError("The AI refused this request for safety reasons. Try different wording.")
+        raise AIError("Gemini returned an empty answer. Try again.")
+    return text
+
+
+# ---------------------------------------------------------------------------
 # Photo helpers
 # ---------------------------------------------------------------------------
 def prepare_photo(photo: Image.Image) -> Image.Image:
@@ -246,21 +307,13 @@ def build_edit_prompt(car_model, preset, colour, finish, rims, bodykit, extras, 
     keyword_style = cf_uses_strength()
     instructions = KEYWORD_PROMPT_INSTRUCTIONS if keyword_style else PROMPT_BUILDER_INSTRUCTIONS
     try:
-        types = _genai_types()
-        client = _get_gemini_client()
-        response = client.models.generate_content(
-            model=text_model(),
-            contents=choices_text,
-            config=types.GenerateContentConfig(system_instruction=instructions),
-        )
-        prompt = (response.text or "").strip()
+        prompt = gemini_text(instructions, [("user", choices_text)]).strip()
         if prompt:
             return prompt, True
     except AIError as exc:
-        if "not installed" in str(exc):
-            print(f"[prompt builder] {exc} Falling back to the template prompt.")
-        else:
+        if str(exc).startswith("No Gemini API key"):
             raise  # missing key: tell the user now
+        print(f"[prompt builder] falling back to template: {exc}")
     except Exception as exc:  # noqa: BLE001 - any LLM failure falls back to the template
         print(f"[prompt builder] falling back to template: {exc}")
     if keyword_style:
@@ -517,27 +570,13 @@ def _genai_types():
 
 
 def advisor_reply(message: str, history: list, car_model: str | None = None) -> str:
-    types = _genai_types()
-    client = _get_gemini_client()
-
-    contents = []
+    turns = []
     for turn in history or []:
         role = turn.get("role") if isinstance(turn, dict) else None
         text = _message_text(turn.get("content")) if isinstance(turn, dict) else ""
         if role in ("user", "assistant") and text:
-            contents.append(
-                types.Content(role="user" if role == "user" else "model", parts=[types.Part(text=text)])
-            )
+            turns.append(("user" if role == "user" else "model", text))
 
     context = f"(The user's car: {car_model}.) " if car_model and not car_model.startswith("Other") else ""
-    contents.append(types.Content(role="user", parts=[types.Part(text=context + message)]))
-
-    try:
-        response = client.models.generate_content(
-            model=text_model(),
-            contents=contents,
-            config=types.GenerateContentConfig(system_instruction=ADVISOR_INSTRUCTIONS),
-        )
-    except Exception as exc:  # noqa: BLE001
-        raise _friendly_error(exc, "style advisor") from exc
-    return (response.text or "Sorry, I couldn't think of a reply. Try asking another way.").strip()
+    turns.append(("user", context + message))
+    return gemini_text(ADVISOR_INSTRUCTIONS, turns)
