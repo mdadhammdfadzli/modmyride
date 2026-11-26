@@ -25,7 +25,7 @@ from PIL import Image, ImageOps
 # Settings (read each time, so secrets set by the hosting platform are always picked up)
 # ---------------------------------------------------------------------------
 def text_model() -> str:
-    return os.getenv("TEXT_MODEL", "gemini-3.5-flash")
+    return os.getenv("TEXT_MODEL", "gemini-3.8-flash")
 
 
 def image_model() -> str:
